@@ -1,0 +1,867 @@
+This document summarizes the essential configurations, port descriptions, and design flow steps required to implement the Xilinx LogiCORE IP Fast Fourier Transform (FFT) v9.1 for both FFT (Forward) and IFFT (Inverse) operations using Verilog and Testbenches.
+
+### **1. Core Overview & Key Features**
+
+The core implements the Cooley-Tukey FFT algorithm. It supports transform sizes  where  (8 to 65,536 points).
+
+* 
+**Data Types:** Fixed-point (unscaled, scaled, block floating-point) or IEEE-754 Single-Precision Floating-Point.
+
+
+* 
+**Interface:** AXI4-Stream compliant (requires `tvalid`, `tready`, `tdata`).
+
+
+
+---
+
+### **2. Essential Verilog Interface Signals**
+
+To instantiate the core in Verilog, you must connect the following AXI4-Stream interfaces.
+
+#### **A. Global Signals**
+
+* 
+**`aclk`**: Rising-edge clock.
+
+
+* **`aresetn`**: Active-Low synchronous clear. **Crucial:** Requires a minimum pulse of two clock cycles.
+
+
+* 
+**`aclken`**: (Optional) Active-High clock enable.
+
+
+
+#### **B. Configuration Channel (`s_axis_config`)**
+
+This channel sets the FFT vs. IFFT mode and transform size at runtime.
+
+* 
+**`s_axis_config_tvalid`**: Master asserts to validate configuration data.
+
+
+* 
+**`s_axis_config_tready`**: Core asserts when ready for new config.
+
+
+* 
+**`s_axis_config_tdata`**: Carries the configuration packet (NFFT, FWD_INV, etc.).
+
+
+
+#### **C. Data Input Channel (`s_axis_data`)**
+
+* 
+**`s_axis_data_tvalid`**: Asserted when input data is valid.
+
+
+* 
+**`s_axis_data_tready`**: Asserted by the core when ready to accept data.
+
+
+* 
+**`s_axis_data_tdata`**: Carries input samples (`XN_RE`, `XN_IM`).
+
+
+* 
+**`s_axis_data_tlast`**: Asserted on the last sample of the frame (used for event generation).
+
+
+
+#### **D. Data Output Channel (`m_axis_data`)**
+
+* 
+**`m_axis_data_tvalid`**: Asserted by core when output data is valid.
+
+
+* 
+**`m_axis_data_tready`**: Asserted by slave (your design) to accept data (Non-Realtime mode only).
+
+
+* 
+**`m_axis_data_tdata`**: Carries output samples (`XK_RE`, `XK_IM`).
+
+
+* 
+**`m_axis_data_tuser`**: (Optional) Carries status like Block Exponent or Overflow per sample.
+
+
+* 
+**`m_axis_data_tlast`**: Asserted by core on the last sample of the output frame.
+
+
+
+---
+
+### **3. Configuration Packet Structure (FFT vs. IFFT)**
+
+To switch between FFT and IFFT or change size, you must drive the `s_axis_config_tdata` bus. The fields are packed from LSB to MSB. Padding is required to align to 8-bit boundaries.
+
+| Field Order (LSB First) | Width | Description & Configuration |
+| --- | --- | --- |
+| **1. NFFT** | 5 bits | **Transform Size:** Value is . 
+
+<br>
+
+<br> *Example:* For 1024 points, set to 10 (`01010`).
+
+ |
+| **2. CP_LEN** | Variable | **Cyclic Prefix:** (Optional) Length of cyclic prefix. Set to 0 if not used.
+
+ |
+| **3. FWD_INV** | 1 bit | <br>**FFT/IFFT Selection:** <br>
+
+<br> **1 = Forward FFT** <br>
+
+<br> **0 = Inverse FFT (IFFT)**.
+
+ |
+| **4. SCALE_SCH** | Variable | <br>**Scaling Schedule:** (Optional) Used for Scaled Fixed-Point mode to prevent overflow.
+
+ |
+| **5. Padding** | Variable | Pad the vector with zeros to the next byte (8-bit) boundary.
+
+ |
+
+> **Important Note for IFFT:** The core does *not* automatically apply the  scaling required for IFFT. You must handle this via the `SCALE_SCH` (scaling schedule) or post-processing.
+> 
+> 
+
+---
+
+### **4. Data Packet Structure (`tdata`)**
+
+Data must be packed correctly into the AXI stream.
+
+**Input (`s_axis_data_tdata`):**
+
+* 
+**Structure:** `[Padding + Imaginary(XN_IM) + Padding + Real(XN_RE)]`.
+
+
+* 
+**Padding:** Each component (`XN_RE`, `XN_IM`) must be padded to 8-bit alignment individually before concatenation.
+
+
+* **Example (12-bit data):** To send Real=001011011001 and Imag=001111100110:
+* Pad Real to 16 bits: `0000_0010_1101_1001`
+* Pad Imag to 16 bits: `0000_0011_1110_0110`
+* Concat: `0000001111100110` `0000001011011001`.
+
+
+
+
+
+**Output (`m_axis_data_tdata`):**
+
+* Follows the same structure: `[Padding + Imaginary(XK_IM) + Padding + Real(XK_RE)]`.
+
+
+* Output order can be **Natural** or **Bit-Reversed** depending on IP customization.
+
+
+
+---
+
+### **5. Implementation Guidelines for Verilog**
+
+#### **Step 1: IP Customization (Vivado)**
+
+1. 
+**Architecture:** Select "Pipelined Streaming I/O" for continuous processing or "Burst I/O" for lower resources.
+
+
+2. **Data Format:** Choose "Fixed Point" or "Float".
+3. **Scaling:**
+* 
+*Unscaled:* Output grows significantly (Input Width + ).
+
+
+* 
+*Scaled:* Requires `SCALE_SCH` input; output width equals input width.
+
+
+* 
+*Block Floating-Point:* Best dynamic range without manual scaling; uses `BLK_EXP` output.
+
+
+
+
+4. 
+**Output Ordering:** "Natural Order" consumes more memory but is easier to process downstream.
+
+
+
+#### **Step 2: Driving the Core (Verilog State Machine)**
+
+1. 
+**Reset:** Assert `aresetn` Low for at least 2 cycles.
+
+
+2. **Configure:**
+* Assemble `s_axis_config_tdata`.
+* Assert `s_axis_config_tvalid` High.
+* Wait for `s_axis_config_tready` High. De-assert `tvalid`.
+
+
+* 
+*Tip:* Configuration can be sent before or during frame loading, but must be committed before the first data sample is loaded for that frame.
+
+
+
+
+3. **Load Data:**
+* Wait for `s_axis_data_tready`.
+* Assert `s_axis_data_tvalid` and drive `s_axis_data_tdata`.
+* Assert `s_axis_data_tlast` on the final sample () of the frame.
+
+
+
+
+4. **Unload Data:**
+* Monitor `m_axis_data_tvalid`.
+* Assert `m_axis_data_tready` (if in Non-Realtime mode) to accept data.
+
+
+* Read `m_axis_data_tdata` (Result) and `m_axis_data_tuser` (Block Exponent/Overflow).
+
+
+
+
+
+---
+
+### **6. Testbench Recommendations**
+
+#### **A. Simulation Setup**
+
+The Vivado design suite generates a demonstration testbench (`demo_tb`) which is a useful starting point.
+
+#### **B. Testbench Logic Flow**
+
+1. **Generate Clock & Reset:** Ensure `aresetn` is held low for >2 cycles.
+2. **Stimulus Generation:** Create complex data (e.g., sine waves).
+3. **Configuration Transaction:**
+* Drive `FWD_INV = 1` (FFT) on Config Channel.
+* Wait for `event_frame_started` or handshake completion.
+
+
+
+
+4. **Data Transaction:**
+* Loop  times to drive input samples.
+* Handle AXI handshaking (wait if `tready` drops).
+
+
+5. **Monitor Output:**
+* Capture `m_axis_data_tdata`.
+* Check `event_fft_overflow` (if scaled).
+
+
+* Check `event_tlast_missing` or `event_tlast_unexpected` to verify frame alignment.
+
+
+
+
+
+#### **C. Modeling Multichannel or IFFT**
+
+* 
+**IFFT Verification:** In the testbench, capture the output of the Forward FFT, feed it back into the input, set `FWD_INV = 0` (Inverse), and verify the output matches the original input (accounting for scaling/precision loss).
+
+
+* 
+**C Model:** Use the provided bit-accurate C model (or MEX function for MATLAB) to generate "Golden Vectors" for comparison in the testbench.
+
+
+
+### **7. Common Pitfalls to Avoid**
+
+* 
+**Reset Pulse Width:** Failing to hold `aresetn` for 2 cycles will result in erratic behavior.
+
+
+* 
+**Padding:** Forgetting to zero-pad fields in `tdata` to 8-bit boundaries leads to data corruption.
+
+
+* **Scaling Overflow:** In Scaled Fixed-Point mode, if `OVFLO` goes high, your `SCALE_SCH` is too aggressive. Increase scaling (shift bits) for earlier stages.
+
+
+* 
+**Real-time Mode:** If "Realtime" throttle scheme is selected, you **cannot** pause input data (waitstates) once a frame starts, or data will be lost. Use "Non-Realtime" for safer AXI handshaking.
+
+=======================================
+
+This document provides the **Verilog implementation** and **Testbench** for the Xilinx FFT IP core (v9.1) configured for dynamic switching between Forward FFT and Inverse FFT (IFFT).
+
+### **1. Important Implementation Notes**
+
+* **IP Generation Required:** You cannot simulate this code alone. You **must** generate the `xfft_0` core in Xilinx Vivado first with the specific parameters (AXI Stream, Run-time configurable transform, etc.).
+
+
+* 
+**Data Alignment:** The input/output complex data (`XN_RE`, `XN_IM`) must be padded to the nearest byte (8-bit) boundary before concatenation.
+
+
+* 
+**Configuration Packet:** The configuration fields (`NFFT`, `FWD_INV`, `SCALE_SCH`) must be packed starting from the LSB.
+
+
+* **Scaling:** For IFFT, the core does *not* apply the  scaling automatically. You must apply a scaling schedule (e.g., shifting) via the `s_axis_config_tdata` interface or post-process the data.
+
+
+
+---
+
+### **2. Verilog Wrapper (`fft_processor.v`)**
+
+This module wraps the Xilinx IP, handling the messy bit-padding and AXI stream handshakes.
+
+```verilog
+`timescale 1ns / 1ps
+
+module fft_processor #(
+    parameter DATA_WIDTH = 16,          // Data bits (X)
+    parameter N_POINTS   = 1024,        // Max Sample points (N)
+    parameter NFFT_WIDTH = 5            // log2(N_POINTS), e.g., log2(1024)=10. 
+                                        // Wait, the IP uses 5 bits for NFFT field (log2(N))? 
+                                        // Actually NFFT field width is 5 bits to represent values 0-31.
+                                        // NFFT value = log2(point_size).
+                                        // Example: 1024 points -> NFFT = 10 (decimal).
+)(
+    input  wire                    aclk,
+    [cite_start]input  wire                    aresetn,       // Active-low synchronous reset (hold for 2+ cycles) [cite: 202]
+    
+    // --- Configuration Interface ---
+    input  wire                    i_cfg_start,   // Pulse high to send configuration
+    [cite_start]input  wire                    i_fwd_inv,     // 1 = Forward FFT, 0 = Inverse FFT [cite: 270]
+    [cite_start]input  wire [11:0]             i_scale_sch,   // Scaling schedule (assuming Radix-4, ~12 bits for 1024 pts) [cite: 273]
+    output wire                    o_cfg_ready,   // Core is ready for config
+    
+    // --- Data Input Interface (Slave) ---
+    input  wire                    i_data_valid,
+    input  wire                    i_data_last,   // Assert on Nth sample
+    input  wire [DATA_WIDTH-1:0]   i_data_re,     // Real component
+    input  wire [DATA_WIDTH-1:0]   i_data_im,     // Imaginary component
+    output wire                    o_data_ready,
+    
+    // --- Data Output Interface (Master) ---
+    output wire                    o_data_valid,
+    output wire                    o_data_last,
+    output wire [DATA_WIDTH-1:0]   o_data_re,     // Real result
+    output wire [DATA_WIDTH-1:0]   o_data_im,     // Imaginary result
+    input  wire                    i_data_ready,  // Downstream ready
+    
+    // --- Events ---
+    output wire                    o_event_frame_started,
+    output wire                    o_event_tlast_unexpected,
+    output wire                    o_event_tlast_missing
+);
+
+    // =========================================================================
+    [cite_start]// 1. Padding Logic for Data Alignment [cite: 301]
+    // =========================================================================
+    // Calculate padded width: Round up to nearest multiple of 8
+    localparam PADDED_WIDTH = ((DATA_WIDTH + 7) / 8) * 8;
+    localparam AXIS_DATA_WIDTH = 2 * PADDED_WIDTH; // Real + Imaginary
+
+    // Pad inputs to 8-bit boundaries
+    wire [PADDED_WIDTH-1:0] pad_data_re = {{(PADDED_WIDTH-DATA_WIDTH){1'b0}}, i_data_re};
+    wire [PADDED_WIDTH-1:0] pad_data_im = {{(PADDED_WIDTH-DATA_WIDTH){1'b0}}, i_data_im};
+
+    // Concatenate for TDATA: [IMAGINARY | [cite_start]REAL] (LSB is Real) [cite: 305]
+    wire [AXIS_DATA_WIDTH-1:0] s_axis_data_tdata;
+    assign s_axis_data_tdata = {pad_data_im, pad_data_re};
+
+    // =========================================================================
+    [cite_start]// 2. Configuration Logic [cite: 285]
+    // =========================================================================
+    // Config packet structure (LSB to MSB):
+    // 1. NFFT (5 bits) + Padding (3 bits) = 8 bits
+    // 2. FWD_INV (1 bit) + Padding (7 bits) = 8 bits
+    // 3. SCALE_SCH (Variable, padded to 8 bits). 
+    //    Example: 1024 points = 12 bits scale schedule. Padded to 16 bits.
+    
+    // NFFT Value: log2(N_POINTS). For 1024, NFFT = 10.
+    wire [4:0] nfft_val = $clog2(N_POINTS); 
+    
+    // Construct TDATA for Config
+    // Note: This layout depends heavily on IP GUI settings. 
+    // Assuming standard layout: NFFT(8b) | FWD_INV(8b) | SCALE_SCH(padded)
+    wire [23:0] s_axis_config_tdata; 
+    
+    // Packing: LSB is NFFT.
+    // [23:16] = SCALE_SCH (Example: simple schedule, usually wider, simplified here for 1024)
+    // [15:8]  = FWD_INV (bit 0 is significant)
+    // [7:0]   = NFFT (5 bits significant)
+    
+    [cite_start]// Note: In real implementation, ensure SCALE_SCH width matches your specific N [cite: 273]
+    assign s_axis_config_tdata[7:0]   = {3'b000, nfft_val};       // NFFT
+    assign s_axis_config_tdata[15:8]  = {7'b0000000, i_fwd_inv};  [cite_start]// FWD_INV [cite: 270]
+    assign s_axis_config_tdata[23:16] = i_scale_sch[7:0];         // SCALE (Simplified)
+
+    // =========================================================================
+    [cite_start]// 3. Output Unpacking [cite: 330]
+    // =========================================================================
+    wire [AXIS_DATA_WIDTH-1:0] m_axis_data_tdata;
+    
+    // Slice the master TDATA back into Real and Imaginary
+    // Remember: TDATA = [IM | RE]
+    assign o_data_re = m_axis_data_tdata[DATA_WIDTH-1:0]; 
+    assign o_data_im = m_axis_data_tdata[PADDED_WIDTH +: DATA_WIDTH];
+
+    // =========================================================================
+    // 4. IP Instantiation (Must match Vivado Component Name)
+    // =========================================================================
+    xfft_0 fft_inst (
+        .aclk(aclk),                                                // input wire aclk
+        .aresetn(aresetn),                                          // input wire aresetn
+        
+        // Configuration Channel
+        .s_axis_config_tvalid(i_cfg_start),                         // input wire s_axis_config_tvalid
+        .s_axis_config_tready(o_cfg_ready),                         // output wire s_axis_config_tready
+        .s_axis_config_tdata(s_axis_config_tdata),                  // input wire [23 : 0] s_axis_config_tdata
+        
+        // Data Input Channel
+        .s_axis_data_tvalid(i_data_valid),                          // input wire s_axis_data_tvalid
+        .s_axis_data_tready(o_data_ready),                          // output wire s_axis_data_tready
+        .s_axis_data_tdata(s_axis_data_tdata),                      // input wire [31 : 0] s_axis_data_tdata
+        .s_axis_data_tlast(i_data_last),                            // input wire s_axis_data_tlast
+        
+        // Data Output Channel
+        .m_axis_data_tvalid(o_data_valid),                          // output wire m_axis_data_tvalid
+        .m_axis_data_tready(i_data_ready),                          // input wire m_axis_data_tready
+        .m_axis_data_tdata(m_axis_data_tdata),                      // output wire [31 : 0] m_axis_data_tdata
+        .m_axis_data_tlast(o_data_last),                            // output wire m_axis_data_tlast
+        
+        // Events
+        .event_frame_started(o_event_frame_started),                // output wire event_frame_started
+        .event_tlast_unexpected(o_event_tlast_unexpected),          // output wire event_tlast_unexpected
+        .event_tlast_missing(o_event_tlast_missing)                 // output wire event_tlast_missing
+    );
+
+endmodule
+
+```
+
+---
+
+### **3. Testbench (`tb_fft_wrapper.v`)**
+
+This testbench simulates a Forward FFT followed by an Inverse FFT to verify functionality.
+
+```verilog
+`timescale 1ns / 1ps
+
+module tb_fft_wrapper;
+
+    // --- Parameters ---
+    parameter DATA_WIDTH = 16;
+    parameter N_POINTS   = 1024; // Transform size (N)
+    parameter CLK_PERIOD = 10;   // 100 MHz clock
+
+    // --- Signals ---
+    reg                     aclk;
+    reg                     aresetn;
+    
+    // Config
+    reg                     i_cfg_start;
+    reg                     i_fwd_inv;
+    reg [11:0]              i_scale_sch;
+    wire                    o_cfg_ready;
+    
+    // Data In
+    reg                     i_data_valid;
+    reg                     i_data_last;
+    reg signed [DATA_WIDTH-1:0] i_data_re;
+    reg signed [DATA_WIDTH-1:0] i_data_im;
+    wire                    o_data_ready;
+    
+    // Data Out
+    wire                    o_data_valid;
+    wire                    o_data_last;
+    wire signed [DATA_WIDTH-1:0] o_data_re;
+    wire signed [DATA_WIDTH-1:0] o_data_im;
+    reg                     i_data_ready;
+    
+    // Events
+    wire                    event_started;
+    wire                    event_unexpected;
+    wire                    event_missing;
+
+    // Storage for verification
+    reg signed [DATA_WIDTH-1:0] capture_mem_re [0:N_POINTS-1];
+    reg signed [DATA_WIDTH-1:0] capture_mem_im [0:N_POINTS-1];
+    integer i;
+
+    // --- DUT Instantiation ---
+    fft_processor #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .N_POINTS(N_POINTS)
+    ) dut (
+        .aclk(aclk),
+        .aresetn(aresetn),
+        .i_cfg_start(i_cfg_start),
+        .i_fwd_inv(i_fwd_inv),
+        .i_scale_sch(i_scale_sch),
+        .o_cfg_ready(o_cfg_ready),
+        .i_data_valid(i_data_valid),
+        .i_data_last(i_data_last),
+        .i_data_re(i_data_re),
+        .i_data_im(i_data_im),
+        .o_data_ready(o_data_ready),
+        .o_data_valid(o_data_valid),
+        .o_data_last(o_data_last),
+        .o_data_re(o_data_re),
+        .o_data_im(o_data_im),
+        .i_data_ready(i_data_ready),
+        .o_event_frame_started(event_started),
+        .o_event_tlast_unexpected(event_unexpected),
+        .o_event_tlast_missing(event_missing)
+    );
+
+    // --- Clock Generation ---
+    initial begin
+        aclk = 0;
+        forever #(CLK_PERIOD/2) aclk = ~aclk;
+    end
+
+    // --- Main Test Process ---
+    initial begin
+        // 1. Initialize
+        aresetn = 0;
+        i_cfg_start = 0;
+        i_data_valid = 0;
+        i_data_ready = 1; // Always ready to receive output
+        i_data_re = 0;
+        i_data_im = 0;
+        i_data_last = 0;
+        
+        [cite_start]// 2. Reset (Hold for at least 2 cycles) [cite: 202]
+        #(CLK_PERIOD * 10);
+        aresetn = 1;
+        #(CLK_PERIOD * 5);
+
+        // ============================================================
+        // TEST CASE 1: Forward FFT
+        // Input: Square Wave (DC Pulse)
+        // ============================================================
+        $display("Starting Forward FFT Configuration...");
+        
+        [cite_start]// Send Config: FWD_INV = 1 (Forward), Scale = Conservative [cite: 589]
+        send_config(1'b1, 12'b01_01_01_01_01_01); // Example scaling
+        
+        $display("Sending Time-Domain Data...");
+        // Send 1024 samples. We will send a pulse: 100 for first 10 samples, 0 for rest.
+        send_stimulus_pulse(1024, 100);
+        
+        // Wait for Output
+        wait(o_data_valid);
+        capture_output(1024);
+        $display("Forward FFT Complete.");
+
+        #(CLK_PERIOD * 20);
+
+        // ============================================================
+        // TEST CASE 2: Inverse FFT (IFFT)
+        // Input: The Frequency-Domain data we just captured
+        // ============================================================
+        $display("Starting Inverse FFT Configuration...");
+        
+        [cite_start]// Send Config: FWD_INV = 0 (Inverse) [cite: 270]
+        send_config(1'b0, 12'b01_01_01_01_01_01);
+        
+        $display("Sending Frequency-Domain Data (from previous step)...");
+        send_stimulus_playback(1024);
+        
+        // Wait for Output
+        wait(o_data_valid);
+        // In simulation waveform, observe if the output resembles the original pulse
+        // Note: Amplitude will be scaled due to processing gain and scaling schedule
+        $display("Inverse FFT Complete. Check waveforms.");
+        
+        #(CLK_PERIOD * 50);
+        $finish;
+    end
+
+    // --- Task: Send Configuration ---
+    task send_config;
+        input fwd;
+        input [11:0] scale;
+        begin
+            // Wait for core to be ready for config
+            wait(o_cfg_ready);
+            @(posedge aclk);
+            i_fwd_inv = fwd;
+            i_scale_sch = scale;
+            i_cfg_start = 1;
+            @(posedge aclk);
+            i_cfg_start = 0;
+            [cite_start]// Configuration is applied before the next frame starts [cite: 758]
+        end
+    endtask
+
+    // --- Task: Send Stimulus (Square Pulse) ---
+    task send_stimulus_pulse;
+        input integer n_samples;
+        input integer amplitude;
+        integer k;
+        begin
+            for (k = 0; k < n_samples; k = k + 1) begin
+                // Wait for core to accept data
+                wait(o_data_ready);
+                @(posedge aclk);
+                
+                i_data_valid = 1;
+                // Generate Pulse: High for k < 10, else 0
+                if (k < 10) i_data_re = amplitude;
+                else        i_data_re = 0;
+                i_data_im = 0;
+                
+                [cite_start]// Assert TLAST on the final sample [cite: 297]
+                if (k == n_samples - 1) i_data_last = 1;
+                else                    i_data_last = 0;
+            end
+            @(posedge aclk);
+            i_data_valid = 0;
+            i_data_last = 0;
+        end
+    endtask
+
+    // --- Task: Capture Output to Memory ---
+    task capture_output;
+        input integer n_samples;
+        integer k;
+        begin
+            for (k = 0; k < n_samples; k = k + 1) begin
+                wait(o_data_valid); // Wait for valid data
+                @(posedge aclk);    // Sample at clock edge
+                if (o_data_valid) begin
+                    capture_mem_re[k] = o_data_re;
+                    capture_mem_im[k] = o_data_im;
+                end else begin
+                    k = k - 1; // Decrement if data wasn't valid this cycle
+                end
+            end
+        end
+    endtask
+
+    // --- Task: Playback Captured Data (for IFFT) ---
+    task send_stimulus_playback;
+        input integer n_samples;
+        integer k;
+        begin
+            for (k = 0; k < n_samples; k = k + 1) begin
+                wait(o_data_ready);
+                @(posedge aclk);
+                
+                i_data_valid = 1;
+                i_data_re = capture_mem_re[k]; // Feed back the FFT result
+                i_data_im = capture_mem_im[k];
+                
+                if (k == n_samples - 1) i_data_last = 1;
+                else                    i_data_last = 0;
+            end
+            @(posedge aclk);
+            i_data_valid = 0;
+            i_data_last = 0;
+        end
+    endtask
+
+endmodule
+
+```
+
+=======================================
+
+Integrating a Finite State Machine (FSM) into the main module is the best practice for handling the AXI4-Stream handshakes, ensuring that the **Configuration** is sent before the **Data**, and managing the flow between FFT and IFFT modes.
+
+Below is the updated Verilog code. I have added a robust FSM to handle the sequence: **Reset → Configure → Load Data → Wait for Result.**
+
+### **Updated Verilog Module with FSM (`fft_processor_fsm.v`)**
+
+```verilog
+`timescale 1ns / 1ps
+
+module fft_processor_fsm #(
+    parameter DATA_WIDTH = 16,
+    parameter N_POINTS   = 1024
+)(
+    input  wire                    aclk,
+    input  wire                    aresetn,
+    
+    // Control Interface
+    input  wire                    i_start_pulse, // Pulse to start a conversion
+    input  wire                    i_fwd_inv,     // 1=FFT, 0=IFFT
+    output reg                     o_busy,
+    output reg                     o_done,
+    
+    // Data Interfaces (Connect to your memory/ADC)
+    input  wire [DATA_WIDTH-1:0]   i_sample_re,
+    input  wire [DATA_WIDTH-1:0]   i_sample_im,
+    output reg  [9:0]              o_sample_addr, // Address to fetch N samples
+    
+    output wire [DATA_WIDTH-1:0]   o_result_re,
+    output wire [DATA_WIDTH-1:0]   o_result_im,
+    output wire                    o_result_valid
+);
+
+    // FSM States
+    localparam IDLE         = 3'd0;
+    localparam CONFIG       = 3'd1;
+    localparam LOAD_DATA    = 3'd2;
+    localparam WAIT_RESULT  = 3'd3;
+    localparam DONE         = 3'd4;
+
+    reg [2:0] state;
+    reg [9:0] sample_count;
+
+    // Internal AXI Signals
+    reg         s_config_tvalid;
+    wire        s_config_tready;
+    reg         s_data_tvalid;
+    wire        s_data_tready;
+    reg         s_data_tlast;
+    
+    // --- FSM Logic ---
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            state           <= IDLE;
+            o_busy          <= 0;
+            o_done          <= 0;
+            s_config_tvalid <= 0;
+            s_data_tvalid   <= 0;
+            s_data_tlast    <= 0;
+            o_sample_addr   <= 0;
+            sample_count    <= 0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    o_done <= 0;
+                    if (i_start_pulse) begin
+                        state  <= CONFIG;
+                        o_busy <= 1;
+                    end
+                end
+
+                CONFIG: begin
+                    s_config_tvalid <= 1;
+                    if (s_config_tready && s_config_tvalid) begin
+                        s_config_tvalid <= 0;
+                        state           <= LOAD_DATA;
+                        sample_count    <= 0;
+                        o_sample_addr   <= 0;
+                    end
+                end
+
+                LOAD_DATA: begin
+                    s_data_tvalid <= 1;
+                    if (s_data_tready) begin
+                        if (sample_count == N_POINTS - 1) begin
+                            s_data_tlast  <= 1;
+                            state         <= WAIT_RESULT;
+                        end else begin
+                            sample_count  <= sample_count + 1;
+                            o_sample_addr <= sample_count + 1;
+                        end
+                    end
+                end
+
+                WAIT_RESULT: begin
+                    s_data_tvalid <= 0;
+                    s_data_tlast  <= 0;
+                    // The core is pipelined; we wait for the last output sample
+                    if (o_result_valid && o_data_last_internal) begin
+                        state <= DONE;
+                    end
+                end
+
+                DONE: begin
+                    o_busy <= 0;
+                    o_done <= 1;
+                    state  <= IDLE;
+                end
+            endcase
+        end
+    end
+
+    // --- Instantiation of the FFT Core ---
+    // (Ensure the TDATA widths match your specific IP GUI configuration)
+    
+    wire o_data_last_internal;
+
+    xfft_0 your_fft_inst (
+        .aclk(aclk),
+        .aresetn(aresetn),
+        
+        // Config Channel
+        .s_axis_config_tdata({15'b0, i_fwd_inv, 3'b0, 5'd10}), // Simplified packing: [Pad|FWD_INV|Pad|NFFT]
+        .s_axis_config_tvalid(s_config_tvalid),
+        .s_axis_config_tready(s_config_tready),
+        
+        // Data Input
+        .s_axis_data_tdata({i_sample_im, i_sample_re}),
+        .s_axis_data_tvalid(s_data_tvalid),
+        .s_axis_data_tready(s_data_tready),
+        .s_axis_data_tlast(s_data_tlast),
+        
+        // Data Output
+        .m_axis_data_tdata({o_result_im, o_result_re}),
+        .m_axis_data_tvalid(o_result_valid),
+        .m_axis_data_tready(1'b1), // Always ready to accept output
+        .m_axis_data_tlast(o_data_last_internal)
+    );
+
+endmodule
+
+```
+
+### **State Descriptions & Configuration Transitions**
+
+1. **IDLE**: The system waits for the `i_start_pulse`. This is where you decide if you are performing an FFT or IFFT by setting `i_fwd_inv`.
+2. **CONFIG**: The FSM asserts `tvalid` on the configuration channel. It **must** wait for the IP core to assert `tready` before moving on. This ensures the core knows whether it's in FFT or IFFT mode for the upcoming frame.
+3. **LOAD_DATA**: The FSM feeds samples one by one.
+* **Crucial:** We only increment the `sample_count` when `s_data_tready` is HIGH. If the FFT core back-pressures (pulls `tready` LOW), the FSM pauses.
+* On the final sample (), we assert `s_data_tlast`.
+
+
+4. **WAIT_RESULT**: Since the FFT is a pipelined architecture, there is a latency between the last input and the first output. The FSM waits in this state until the `m_axis_data_tlast` signal is received from the core, indicating the entire frame has been processed.
+
+### **Modified Testbench Snippet for FSM**
+
+Instead of manually toggling signals, your testbench now only needs to pulse the start signal:
+
+```verilog
+initial begin
+    // Reset system
+    aresetn = 0; #100; aresetn = 1; #100;
+
+    // Run Forward FFT
+    i_fwd_inv = 1; 
+    i_start_pulse = 1;
+    @(posedge aclk);
+    i_start_pulse = 0;
+    
+    wait(o_done);
+    $display("FFT Frame Processed");
+
+    // Run Inverse FFT (IFFT)
+    #500;
+    i_fwd_inv = 0; 
+    i_start_pulse = 1;
+    @(posedge aclk);
+    i_start_pulse = 0;
+    
+    wait(o_done);
+    $display("IFFT Frame Processed");
+end
+
+```
+
+### **Required Configuration Summary for Verilog**
+
+* **Clock Alignment**: Ensure the FSM and the IP core share the same `aclk`.
+* **TLAST**: Always ensure `s_axis_data_tlast` is high for exactly one clock cycle—the same cycle where the  sample is valid.
+* **Bit-Reverse**: If your IP is configured for bit-reversed output, your FSM may need an additional state or a reorder-buffer to store the results in natural order.
